@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vechealth"
+version = "0.1.0"
+description = "Observability and diagnostic framework for embedding spaces and vector stores"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+keywords = ["embeddings", "vector-database", "observability", "RAG", "diagnostics", "topological-data-analysis"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["python/vechealth"]
