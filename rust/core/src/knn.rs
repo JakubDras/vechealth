@@ -156,20 +156,23 @@ impl VecHealthEvaluator {
         Ok(report)
     }
 
-    pub fn get_original_vector(&self, index: usize) -> ArrayView1<f32> {
+    pub fn get_original_vector(&self, index: usize) -> ArrayView1<'_, f32> {
         self.vectors.row(index)
     }
-    
+
     pub fn n_vectors(&self) -> usize {
         self.n_vectors
     }
 
+    pub fn vectors(&self) -> ArrayView2<'_, f32> {
+        self.vectors.view()
+    }
 
     pub fn get_knn(
         &mut self,
         k: usize,
         batch_size: usize,
-    ) -> Result<(ArrayView2<f32>, ArrayView2<u32>), VecHealthError> {
+    ) -> Result<(ArrayView2<'_, f32>, ArrayView2<'_, u32>), VecHealthError> {
         if k >= self.n_vectors {
             return Err(VecHealthError::KTooLarge { k, n_vectors: self.n_vectors });
         }
@@ -228,13 +231,18 @@ fn blocked_topk_cosine(
                     .map(|(idx, &sim)| (sim, idx as u32))
                     .collect();
 
-                let (top, _, _) = sims_with_idx.select_nth_unstable_by(k, |a, b| {
-                    b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
-                });
+                let k_actual = k.min(sims_with_idx.len());
 
+                if k_actual < sims_with_idx.len() {
+                    sims_with_idx.select_nth_unstable_by(k_actual, |a, b| {
+                        b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
+                    });
+                }
+
+                let top = &mut sims_with_idx[..k_actual];
                 top.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
 
-                for i in 0..k {
+                for i in 0..k_actual {
                     let sim = top[i].0;
                     let euclidean_dist = f32::max(0.0, 2.0 - 2.0 * sim).sqrt();
                     dist_row[i] = euclidean_dist;
