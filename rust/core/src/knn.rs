@@ -306,4 +306,16 @@ mod tests {
         assert_eq!(original[0], 3.0);
         assert_eq!(original[1], 4.0);
     }
+
+    #[test]
+    fn get_knn_does_not_panic_at_maximum_k() {
+        let vectors = array![
+        [1.0f32, 0.0],
+        [0.0, 1.0],
+        [-1.0, 0.0],
+    ];
+        let mut evaluator = VecHealthEvaluator::new(vectors).unwrap();
+        let result = evaluator.get_knn(2, 10);
+        assert!(result.is_ok());
+    }
 }
