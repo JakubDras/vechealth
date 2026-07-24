@@ -4,3 +4,5 @@ pub mod anisotropy;
 pub mod outliers;
 pub mod duplicates;
 pub mod intrinsic_dim;
+pub mod qmas;
+pub mod snc;

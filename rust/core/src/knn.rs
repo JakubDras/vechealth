@@ -8,6 +8,7 @@ pub enum VecHealthError {
     EmptyInput,
     DimensionMismatch { expected: usize, found: usize },
     KTooLarge { k: usize, n_vectors: usize },
+    KTooSmall { k: usize, minimum: usize },
     AllVectorsDegenerate,
 }
 
@@ -20,6 +21,9 @@ impl fmt::Display for VecHealthError {
             }
             Self::KTooLarge { k, n_vectors } => {
                 write!(f, "k={} was requested, but only {} vectors are available.", k, n_vectors)
+            }
+            Self::KTooSmall { k, minimum } => {
+                write!(f, "k={} was requested, but this metric requires k >= {}.", k, minimum)
             }
             Self::AllVectorsDegenerate => write!(f, "All vectors have zero norm."),
         }
@@ -156,6 +160,11 @@ impl VecHealthEvaluator {
         Ok(report)
     }
 
+    pub fn normalized_vectors(&mut self) -> Result<&Array2<f32>, VecHealthError> {
+        let (normalized, _report) = self.ensure_normalized()?;
+        Ok(normalized)
+    }
+
     pub fn get_original_vector(&self, index: usize) -> ArrayView1<'_, f32> {
         self.vectors.row(index)
     }
@@ -174,7 +183,10 @@ impl VecHealthEvaluator {
         batch_size: usize,
     ) -> Result<(ArrayView2<'_, f32>, ArrayView2<'_, u32>), VecHealthError> {
         if k >= self.n_vectors {
-            return Err(VecHealthError::KTooLarge { k, n_vectors: self.n_vectors });
+            return Err(VecHealthError::KTooLarge {
+                k,
+                n_vectors: self.n_vectors,
+            });
         }
 
         let need_recompute = match &self.knn_cache {
@@ -207,49 +219,56 @@ fn blocked_topk_cosine(
     let mut all_distances = Array2::<f32>::zeros((n, k));
     let mut all_indices = Array2::<u32>::zeros((n, k));
 
-    for batch_start in (0..n).step_by(batch_size) {
-        let batch_end = (batch_start + batch_size).min(n);
-        let query_batch = normalized_vectors.slice(s![batch_start..batch_end, ..]);
-        let sim_batch = query_batch.dot(&normalized_vectors.t());
+    // Zrównoleglenie po paczkach (batchach) na poziomie Rayona
+    all_distances
+        .axis_chunks_iter_mut(Axis(0), batch_size)
+        .into_par_iter()
+        .zip(
+            all_indices
+                .axis_chunks_iter_mut(Axis(0), batch_size)
+                .into_par_iter(),
+        )
+        .enumerate()
+        .for_each(|(chunk_idx, (mut dist_chunk, mut idx_chunk))| {
+            let batch_start = chunk_idx * batch_size;
+            let batch_end = (batch_start + batch_size).min(n);
+            let query_batch = normalized_vectors.slice(s![batch_start..batch_end, ..]);
+            let sim_batch = query_batch.dot(&normalized_vectors.t());
 
-        let mut dist_batch_out = all_distances.slice_mut(s![batch_start..batch_end, ..]);
-        let mut idx_batch_out = all_indices.slice_mut(s![batch_start..batch_end, ..]);
+            dist_chunk
+                .axis_iter_mut(Axis(0))
+                .zip(idx_chunk.axis_iter_mut(Axis(0)))
+                .zip(sim_batch.axis_iter(Axis(0)))
+                .enumerate()
+                .for_each(|(local_row, ((mut dist_row, mut idx_row), sim_row))| {
+                    let global_row = batch_start + local_row;
 
-        dist_batch_out
-            .axis_iter_mut(Axis(0))
-            .into_par_iter()
-            .zip(idx_batch_out.axis_iter_mut(Axis(0)).into_par_iter())
-            .zip(sim_batch.axis_iter(Axis(0)).into_par_iter())
-            .enumerate()
-            .for_each(|(local_row, ((mut dist_row, mut idx_row), sim_row))| {
-                let global_row = batch_start + local_row;
+                    let mut sims_with_idx: Vec<(f32, u32)> = sim_row
+                        .iter()
+                        .enumerate()
+                        .filter(|&(idx, _)| idx != global_row)
+                        .map(|(idx, &sim)| (sim, idx as u32))
+                        .collect();
 
-                let mut sims_with_idx: Vec<(f32, u32)> = sim_row
-                    .iter()
-                    .enumerate()
-                    .filter(|&(idx, _)| idx != global_row)
-                    .map(|(idx, &sim)| (sim, idx as u32))
-                    .collect();
+                    let k_actual = k.min(sims_with_idx.len());
 
-                let k_actual = k.min(sims_with_idx.len());
+                    if k_actual < sims_with_idx.len() {
+                        sims_with_idx.select_nth_unstable_by(k_actual, |a, b| {
+                            b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
+                        });
+                    }
 
-                if k_actual < sims_with_idx.len() {
-                    sims_with_idx.select_nth_unstable_by(k_actual, |a, b| {
-                        b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
-                    });
-                }
+                    let top = &mut sims_with_idx[..k_actual];
+                    top.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
 
-                let top = &mut sims_with_idx[..k_actual];
-                top.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-
-                for i in 0..k_actual {
-                    let sim = top[i].0;
-                    let euclidean_dist = f32::max(0.0, 2.0 - 2.0 * sim).sqrt();
-                    dist_row[i] = euclidean_dist;
-                    idx_row[i] = top[i].1;
-                }
-            });
-    }
+                    for i in 0..k_actual {
+                        let sim = top[i].0;
+                        let euclidean_dist = f32::max(0.0, 2.0 - 2.0 * sim).sqrt();
+                        dist_row[i] = euclidean_dist;
+                        idx_row[i] = top[i].1;
+                    }
+                });
+        });
 
     Ok((all_distances, all_indices))
 }
@@ -276,11 +295,7 @@ mod tests {
 
     #[test]
     fn degenerate_vector_does_not_fail_whole_batch() {
-        let vectors = array![
-            [1.0f32, 0.0],
-            [0.0, 0.0],
-            [0.0, 1.0],
-        ];
+        let vectors = array![[1.0f32, 0.0], [0.0, 0.0], [0.0, 1.0]];
         let mut evaluator = VecHealthEvaluator::new(vectors).unwrap();
         let report = evaluator.normalization_report().unwrap();
         assert_eq!(report.degenerate_indices, vec![1]);
@@ -309,11 +324,7 @@ mod tests {
 
     #[test]
     fn get_knn_does_not_panic_at_maximum_k() {
-        let vectors = array![
-        [1.0f32, 0.0],
-        [0.0, 1.0],
-        [-1.0, 0.0],
-    ];
+        let vectors = array![[1.0f32, 0.0], [0.0, 1.0], [-1.0, 0.0]];
         let mut evaluator = VecHealthEvaluator::new(vectors).unwrap();
         let result = evaluator.get_knn(2, 10);
         assert!(result.is_ok());
