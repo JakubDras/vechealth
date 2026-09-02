@@ -1,0 +1,19 @@
+[package]
+name = "vechealth_bindings"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+vechealth-core = { path = "../core" }
+vechealth-connectors = { path = "../connectors" }
+vechealth-report = { path = "../report" }
+pyo3 = { version = "0.21", features = ["extension-module"] }
+numpy = "0.21"
+ndarray = "0.15"
+serde = "1"
+serde_json = "1"
+pythonize = "0.21"
