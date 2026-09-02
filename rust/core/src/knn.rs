@@ -1,7 +1,8 @@
 use ndarray::{s, Array2, ArrayView1, ArrayView2, Axis};
 use rayon::prelude::*;
-use std::cmp::Ordering;
 use std::fmt;
+use pyo3::exceptions::PyValueError;
+use pyo3::PyErr;
 
 #[derive(Debug)]
 pub enum VecHealthError {
@@ -209,6 +210,23 @@ impl VecHealthEvaluator {
     }
 }
 
+// Wstawia (val, idx) do top_k utrzymywanego posortowanego rosnąco wg `val`
+// (top_k[0] = najmniejsza wartość w bieżącym top-k = pierwsza do wyrzucenia).
+// O(1) gdy val nie łapie się do top-k, O(k) gdy się łapie — bez alokacji.
+// Ten sam wzorzec co insert_top_k w metrics/qmas.rs.
+#[inline(always)]
+fn insert_top_k(top_k: &mut [(f32, u32)], val: f32, idx: u32) {
+    if val <= top_k[0].0 {
+        return;
+    }
+    top_k[0] = (val, idx);
+    let mut i = 0;
+    while i + 1 < top_k.len() && top_k[i].0 > top_k[i + 1].0 {
+        top_k.swap(i, i + 1);
+        i += 1;
+    }
+}
+
 fn blocked_topk_cosine(
     normalized_vectors: ArrayView2<f32>,
     k: usize,
@@ -235,6 +253,12 @@ fn blocked_topk_cosine(
             let query_batch = normalized_vectors.slice(s![batch_start..batch_end, ..]);
             let sim_batch = query_batch.dot(&normalized_vectors.t());
 
+            // Bufor top-k alokowany RAZ na cały batch (nie na wiersz) i
+            // resetowany między wierszami — zamiast Vec<(f32,u32)> rozmiaru
+            // n alokowanego dla każdego z n wierszy (poprzednio O(n) alokacji
+            // po O(n) elementów każda).
+            let mut top_k: Vec<(f32, u32)> = vec![(f32::NEG_INFINITY, u32::MAX); k];
+
             dist_chunk
                 .axis_iter_mut(Axis(0))
                 .zip(idx_chunk.axis_iter_mut(Axis(0)))
@@ -243,34 +267,35 @@ fn blocked_topk_cosine(
                 .for_each(|(local_row, ((mut dist_row, mut idx_row), sim_row))| {
                     let global_row = batch_start + local_row;
 
-                    let mut sims_with_idx: Vec<(f32, u32)> = sim_row
-                        .iter()
-                        .enumerate()
-                        .filter(|&(idx, _)| idx != global_row)
-                        .map(|(idx, &sim)| (sim, idx as u32))
-                        .collect();
-
-                    let k_actual = k.min(sims_with_idx.len());
-
-                    if k_actual < sims_with_idx.len() {
-                        sims_with_idx.select_nth_unstable_by(k_actual, |a, b| {
-                            b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
-                        });
+                    top_k.fill((f32::NEG_INFINITY, u32::MAX));
+                    for (idx, &sim) in sim_row.iter().enumerate() {
+                        if idx == global_row {
+                            continue;
+                        }
+                        insert_top_k(&mut top_k, sim, idx as u32);
                     }
 
-                    let top = &mut sims_with_idx[..k_actual];
-                    top.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-
-                    for i in 0..k_actual {
-                        let sim = top[i].0;
+                    // top_k jest posortowane rosnąco wg podobieństwa, więc
+                    // najbliższy sąsiad (najwyższe podobieństwo) to top_k[k-1].
+                    // k < n_vectors jest wymuszone w get_knn, więc mamy co
+                    // najmniej k kandydatów (n-1 >= k) i żaden slot nie
+                    // zostaje sentinelem NEG_INFINITY.
+                    for i in 0..k {
+                        let (sim, neighbor_idx) = top_k[k - 1 - i];
                         let euclidean_dist = f32::max(0.0, 2.0 - 2.0 * sim).sqrt();
                         dist_row[i] = euclidean_dist;
-                        idx_row[i] = top[i].1;
+                        idx_row[i] = neighbor_idx;
                     }
                 });
         });
 
     Ok((all_distances, all_indices))
+}
+
+impl From<VecHealthError> for PyErr {
+    fn from(err: VecHealthError) -> Self {
+        PyValueError::new_err(err.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -328,5 +353,69 @@ mod tests {
         let mut evaluator = VecHealthEvaluator::new(vectors).unwrap();
         let result = evaluator.get_knn(2, 10);
         assert!(result.is_ok());
+    }
+
+    // Test tymczasowy: weryfikuje, że nowy insert_top_k w blocked_topk_cosine
+    // daje identyczne wyniki co niezależna, naiwna referencja O(n^2 log n)
+    // (pełne sortowanie każdego wiersza), dla różnych n, k, batch_size.
+    #[test]
+    fn blocked_topk_matches_naive_full_sort_reference() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        for &(n, dim, k, batch_size) in &[
+            (5usize, 3usize, 2usize, 2usize),
+            (50, 8, 5, 7),
+            (200, 16, 10, 32),
+            (200, 16, 1, 200),
+            (37, 4, 36, 5), // k = n - 1, przypadek graniczny
+        ] {
+            let mut rng = StdRng::seed_from_u64(42 + n as u64);
+            let data: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let vectors = Array2::from_shape_vec((n, dim), data).unwrap();
+
+            let mut evaluator = VecHealthEvaluator::new(vectors.clone()).unwrap();
+            let (distances, indices) = evaluator.get_knn(k, batch_size).unwrap();
+
+            // Referencja: normalizuj ręcznie, policz pełną macierz cosine,
+            // dla każdego wiersza posortuj malejąco po podobieństwie.
+            let (normalized, _) = normalize_l2_with_report(vectors.view(), 1e-3).unwrap();
+            for i in 0..n {
+                let row_i = normalized.row(i);
+                let mut sims: Vec<(f32, u32)> = (0..n)
+                    .filter(|&j| j != i)
+                    .map(|j| {
+                        let row_j = normalized.row(j);
+                        let sim: f32 = row_i.iter().zip(row_j.iter()).map(|(a, b)| a * b).sum();
+                        (sim, j as u32)
+                    })
+                    .collect();
+                sims.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+                for rank in 0..k {
+                    let expected_sim = sims[rank].0;
+                    let expected_dist = f32::max(0.0, 2.0 - 2.0 * expected_sim).sqrt();
+                    let got_dist = distances[[i, rank]];
+                    assert!(
+                        (got_dist - expected_dist).abs() < 1e-4,
+                        "n={n} k={k} row={i} rank={rank}: got dist {got_dist}, expected {expected_dist}"
+                    );
+
+                    // Indeks może się różnić tylko przy dokładnych remisach
+                    // podobieństwa — sprawdzamy więc, że zwrócony indeks ma
+                    // dokładnie takie samo podobieństwo jak oczekiwane.
+                    let got_idx = indices[[i, rank]] as usize;
+                    let got_sim: f32 = row_i
+                        .iter()
+                        .zip(normalized.row(got_idx).iter())
+                        .map(|(a, b)| a * b)
+                        .sum();
+                    assert!(
+                        (got_sim - expected_sim).abs() < 1e-4,
+                        "n={n} k={k} row={i} rank={rank}: got_idx={got_idx} sim={got_sim}, expected sim={expected_sim}"
+                    );
+                }
+            }
+        }
     }
 }

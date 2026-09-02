@@ -20,40 +20,47 @@ pub fn compute_hubness_score(
         occurrences[idx as usize] += 1;
     }
 
-    let max_occurrences = occurrences.iter().copied().max().unwrap_or(0);
-    let orphans_count = occurrences.iter().filter(|&&c| c == 0).count();
-    let orphans_fraction = orphans_count as f64 / n as f64;
-    let hubness_skewness = fisher_pearson_skewness(&occurrences);
+    // Jeden przebieg po occurrences: Welford/Terriberry online moments (mean,
+    // M2, M3) razem z max i orphans. Numerycznie stabilne (bez odejmowania
+    // dużych surowych momentów) i tanie (jedno przejście po pamięci).
+    let mut count = 0.0f64;
+    let mut mean = 0.0f64;
+    let mut m2 = 0.0f64;
+    let mut m3 = 0.0f64;
+    let mut max_occurrences = 0u32;
+    let mut orphans_count = 0usize;
+    for &c in &occurrences {
+        if c > max_occurrences {
+            max_occurrences = c;
+        }
+        if c == 0 {
+            orphans_count += 1;
+        }
+
+        let x = c as f64;
+        let n1 = count;
+        count += 1.0;
+        let delta = x - mean;
+        let delta_n = delta / count;
+        let term1 = delta * delta_n * n1;
+        mean += delta_n;
+        m3 += term1 * delta_n * (count - 2.0) - 3.0 * delta_n * m2;
+        m2 += term1;
+    }
+    let n_f64 = n as f64;
+    let orphans_fraction = orphans_count as f64 / n_f64;
+
+    let hubness_skewness = if m2 <= 0.0 {
+        0.0
+    } else {
+        (n_f64.sqrt() * m3) / m2.powf(1.5)
+    };
 
     Ok(HubnessResult {
         hubness_skewness,
         orphans_fraction,
         max_occurrences,
     })
-}
-
-fn fisher_pearson_skewness(counts: &[u32]) -> f64 {
-    let n = counts.len() as f64;
-    if n == 0.0 {
-        return 0.0;
-    }
-
-    let mean = counts.iter().map(|&c| c as f64).sum::<f64>() / n;
-
-    let mut m2 = 0.0f64;
-    let mut m3 = 0.0f64;
-    for &c in counts {
-        let d = c as f64 - mean;
-        m2 += d * d;
-        m3 += d * d * d;
-    }
-    m2 /= n;
-    m3 /= n;
-
-    if m2 == 0.0 {
-        return 0.0;
-    }
-    m3 / m2.powf(1.5)
 }
 
 #[cfg(test)]
