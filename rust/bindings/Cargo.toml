@@ -1,0 +1,31 @@
+[package]
+name = "vechealth_bindings"
+version = "0.2.0-alpha.1"
+edition = "2021"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+# Which network connectors are compiled into the extension module. The
+# defaults are what the PyPI wheels ship. `lancedb` is opt-in
+# (`maturin build --features lancedb`): without it, `from_lancedb` is served
+# by the pure-Python wrapper over the official `lancedb` SDK.
+[features]
+default = ["qdrant", "pgvector"]
+qdrant = ["vechealth-connectors/qdrant"]
+pgvector = ["vechealth-connectors/pgvector"]
+lancedb = ["vechealth-connectors/lancedb"]
+
+[dependencies]
+vechealth-core = { path = "../core" }
+vechealth-connectors = { path = "../connectors", default-features = false }
+vechealth-report = { path = "../report" }
+# `abi3-py310`: one stable-ABI wheel per platform that works on every CPython
+# >= 3.10, including interpreters newer than this PyO3 release knows about.
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py310"] }
+numpy = "0.21"
+ndarray = "0.15"
+serde = "1"
+serde_json = "1"
+pythonize = "0.21"

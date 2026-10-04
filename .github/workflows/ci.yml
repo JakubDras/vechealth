@@ -1,0 +1,240 @@
+# CI for the Rust workspace and the Python package built from it.
+#
+# Wheels: the extension is built against the CPython stable ABI (PyO3's
+# `abi3-py310` feature), so ONE wheel per platform serves every CPython >= 3.10
+# — the build job does not need an interpreter matrix, and `wheel-compat`
+# below installs the Linux wheel on each supported interpreter to prove it.
+#
+# This workflow builds and tests; it does NOT publish anything. Uploading to
+# PyPI is a separate, deliberate step (see CHANGELOG.md / README).
+name: CI
+
+on:
+  push:
+    branches: [main, temp]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The bundled PyO3 (0.21) officially supports CPython <= 3.12. The wheels are
+  # abi3, so the interpreter used at BUILD time only has to be >= 3.10; this
+  # keeps the build script from refusing a newer one (for example inside a
+  # manylinux container that ships several interpreters).
+  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+
+jobs:
+  rust-test:
+    name: cargo test (workspace, default features)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # Default features (local loaders, Qdrant, pgvector) need no protoc.
+      - run: cargo test --workspace
+        working-directory: rust
+
+  # The native LanceDB connector is behind an opt-in Cargo feature because its
+  # dependency tree is by far the heaviest. Its build compiles .proto files via
+  # `prost-build`, which needs a system `protoc`.
+  rust-test-lancedb:
+    name: cargo test (connectors, native LanceDB feature)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install protoc (LanceDB build dependency)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo test -p vechealth-connectors --features lancedb
+        working-directory: rust
+
+  # `rust-test` only proves the crates compile and pass their own unit tests,
+  # not that the compiled extension works from Python. This job builds it and
+  # runs the Python-facing suites against it.
+  python-test:
+    name: pytest + Python smoke tests
+    needs: rust-test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # `maturin develop` needs a virtualenv.
+      - name: Build and install the extension in-place
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install maturin pytest
+          maturin develop --manifest-path rust/bindings/Cargo.toml
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      # Test-only dependencies of python/tests/local_connectors_test.py: real,
+      # official SDKs, none of them a runtime dependency of vechealth itself.
+      # The LanceDB SDK doubles as the dependency of the pure-Python LanceDB
+      # connector that the default (wheel) build uses.
+      - name: Install connector smoke-test dependencies
+        run: python -m pip install pyarrow lancedb "pymilvus[milvus_lite]" chromadb
+
+      - name: pytest (interpretation layer, CLI, hub inspector, report)
+        run: pytest rust/bindings/python/tests/ -q
+
+      - name: Connector smoke test (local files, LanceDB, Milvus Lite, Chroma end-to-end)
+        run: python python/tests/local_connectors_test.py
+
+      - name: Flexible-input smoke test
+        run: python python/tests/test_flexible_input.py
+
+      - name: Report / baseline-tracking smoke test
+        run: python python/tests/test_report.py
+
+      - name: CLI smoke test (`vechealth analyze` / `vechealth compare`)
+        run: |
+          python -c "
+          import numpy as np
+          rng = np.random.default_rng(0)
+          np.save('/tmp/v1.npy', rng.standard_normal((200, 8)).astype(np.float32))
+          np.save('/tmp/v2.npy', rng.standard_normal((200, 8)).astype(np.float32))
+          "
+          vechealth analyze /tmp/v1.npy --output /tmp/r1.json --tag ci=true
+          vechealth analyze /tmp/v2.npy --output /tmp/r2.json
+          vechealth compare /tmp/r1.json /tmp/r2.json
+
+  build-wheels:
+    name: wheel / ${{ matrix.platform.os }}-${{ matrix.platform.target }}
+    needs: rust-test
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: linux
+            runner: ubuntu-24.04
+            target: x86_64
+          # A native arm64 runner: cross-compiling from x86_64 failed in
+          # manylinux2014's old cross GCC (it cannot assemble `ring`), and this
+          # way the wheel is also installed and smoke-tested for real.
+          - os: linux
+            runner: ubuntu-24.04-arm
+            target: aarch64
+          - os: windows
+            runner: windows-latest
+            target: x64
+          - os: macos
+            runner: macos-15-intel # Intel Mac
+            target: x86_64
+          - os: macos
+            runner: macos-latest # Apple Silicon (arm64)
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # One abi3 wheel per platform (no --find-interpreter needed). The
+      # release profile in rust/Cargo.toml strips symbols and enables thin LTO.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --manifest-path rust/bindings/Cargo.toml
+          manylinux: auto
+
+      # PyPI rejects files over 100 MB; fail early, with headroom.
+      - name: Wheel size guard
+        shell: bash
+        run: |
+          ls -l dist
+          for wheel in dist/*.whl; do
+            size=$(wc -c < "$wheel")
+            echo "$wheel: $size bytes"
+            if [ "$size" -ge 94371840 ]; then
+              echo "::error::$wheel is larger than 90 MiB (PyPI's limit is 100 MB)"
+              exit 1
+            fi
+          done
+
+      # Every platform builds natively, so this installs the wheel it just
+      # built and runs the compiled extension: a real test, not just a build.
+      - name: Install wheel and smoke-test
+        shell: bash
+        run: |
+          python -m pip install numpy
+          python -m pip install --pre --no-index --find-links dist vechealth
+          python -c "import vechealth as vh, numpy as np; print(vh.__version__, vh.compiled_features()); e = vh.VecHealthEvaluator(np.random.randn(50, 8).astype(np.float32)); print(e.compute_all())"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          path: dist
+
+  # The wheel is abi3: install the Linux x86_64 one on every supported CPython
+  # and run the whole Python-facing suite against it.
+  wheel-compat:
+    name: abi3 wheel on CPython ${{ matrix.python-version }}
+    needs: build-wheels
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+      - name: Install the wheel and run the Python test suite against it
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # numpy first: the wheel is installed with --no-index, so its
+          # dependency has to be present already.
+          python -m pip install pytest numpy
+          python -m pip install --pre --no-index --find-links dist vechealth
+          # Copy the tests out of the checkout so that `import vechealth` can
+          # only resolve to the installed wheel, never to the source tree.
+          mkdir -p "$RUNNER_TEMP/suite" && cp -r rust/bindings/python/tests "$RUNNER_TEMP/suite/tests"
+          cd "$RUNNER_TEMP/suite" && python -m pytest tests -q
+
+  sdist:
+    name: sdist
+    needs: rust-test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path rust/bindings/Cargo.toml
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist
+          path: dist

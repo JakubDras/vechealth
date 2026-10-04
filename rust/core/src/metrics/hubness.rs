@@ -20,40 +20,47 @@ pub fn compute_hubness_score(
         occurrences[idx as usize] += 1;
     }
 
-    let max_occurrences = occurrences.iter().copied().max().unwrap_or(0);
-    let orphans_count = occurrences.iter().filter(|&&c| c == 0).count();
-    let orphans_fraction = orphans_count as f64 / n as f64;
-    let hubness_skewness = fisher_pearson_skewness(&occurrences);
+    // One pass over occurrences: Welford/Terriberry online moments (mean,
+    // M2, M3) together with the max and the orphans. Numerically stable (no
+    // subtraction of large raw moments) and cheap (a single pass over memory).
+    let mut count = 0.0f64;
+    let mut mean = 0.0f64;
+    let mut m2 = 0.0f64;
+    let mut m3 = 0.0f64;
+    let mut max_occurrences = 0u32;
+    let mut orphans_count = 0usize;
+    for &c in &occurrences {
+        if c > max_occurrences {
+            max_occurrences = c;
+        }
+        if c == 0 {
+            orphans_count += 1;
+        }
+
+        let x = c as f64;
+        let n1 = count;
+        count += 1.0;
+        let delta = x - mean;
+        let delta_n = delta / count;
+        let term1 = delta * delta_n * n1;
+        mean += delta_n;
+        m3 += term1 * delta_n * (count - 2.0) - 3.0 * delta_n * m2;
+        m2 += term1;
+    }
+    let n_f64 = n as f64;
+    let orphans_fraction = orphans_count as f64 / n_f64;
+
+    let hubness_skewness = if m2 <= 0.0 {
+        0.0
+    } else {
+        (n_f64.sqrt() * m3) / m2.powf(1.5)
+    };
 
     Ok(HubnessResult {
         hubness_skewness,
         orphans_fraction,
         max_occurrences,
     })
-}
-
-fn fisher_pearson_skewness(counts: &[u32]) -> f64 {
-    let n = counts.len() as f64;
-    if n == 0.0 {
-        return 0.0;
-    }
-
-    let mean = counts.iter().map(|&c| c as f64).sum::<f64>() / n;
-
-    let mut m2 = 0.0f64;
-    let mut m3 = 0.0f64;
-    for &c in counts {
-        let d = c as f64 - mean;
-        m2 += d * d;
-        m3 += d * d * d;
-    }
-    m2 /= n;
-    m3 /= n;
-
-    if m2 == 0.0 {
-        return 0.0;
-    }
-    m3 / m2.powf(1.5)
 }
 
 #[cfg(test)]
@@ -63,10 +70,10 @@ mod tests {
 
     #[test]
     fn hand_computed_triangle_no_dominant_hub() {
-        // A=(1,0), B=(0.8,0.6), C=(0,1) — trójkąt bez remisów.
+        // A=(1,0), B=(0.8,0.6), C=(0,1) — a triangle without ties.
         // sim(A,B)=0.8, sim(A,C)=0.0, sim(B,C)=0.6
         // NN(A)=B, NN(B)=A, NN(C)=B  =>  occurrences = [A:1, B:2, C:0]
-        // mean=1, m2=0.6667, m3=0.0  =>  skewness = 0.0 dokładnie
+        // mean=1, m2=0.6667, m3=0.0  =>  skewness = 0.0 exactly
         let vectors = array![
             [1.0f32, 0.0],
             [0.8, 0.6],
@@ -82,8 +89,8 @@ mod tests {
 
     #[test]
     fn hand_computed_hub_with_three_satellites() {
-        // Hub=(1,0,0,0). Trzy satelity, każdy bliżej huba (sim≈0.99)
-        // niż siebie nawzajem (sim≈0.98) — celowo zaprojektowany hub.
+        // Hub=(1,0,0,0). Three satellites, each closer to the hub (sim≈0.99)
+        // than to one another (sim≈0.98) — a deliberately designed hub.
         let vectors = array![
             [1.0f32, 0.0, 0.0, 0.0],
             [0.99, 0.14, 0.0, 0.0],
@@ -93,11 +100,11 @@ mod tests {
         let mut evaluator = VecHealthEvaluator::new(vectors).unwrap();
         let result = compute_hubness_score(&mut evaluator, 1, 10).unwrap();
 
-        // hub (idx 0) zostaje NN dla wszystkich 3 satelitów;
-        // dokładnie jeden satelita zostaje NN samego huba (remis losowy
-        // między satelitami, ale to nie wpływa na poniższe asercje)
+        // the hub (idx 0) stays the NN of all 3 satellites; exactly one
+        // satellite becomes the NN of the hub itself (a tie between the
+        // satellites, which does not affect the assertions below)
         assert_eq!(result.max_occurrences, 3);
         assert!((result.orphans_fraction - 0.5).abs() < 1e-4);
-        assert!(result.hubness_skewness > 0.5); // wyraźnie dodatnia skośność
+        assert!(result.hubness_skewness > 0.5); // clearly positive skewness
     }
 }

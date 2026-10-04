@@ -31,18 +31,18 @@ pub fn compute_snc_score(
     let full_slice = sorted_neighbors
         .as_slice()
         .expect("The matrix is contiguous in memory.");
-
-    let sum_snc: f32 = (0..n)
+    
+    let per_point: Vec<f64> = (0..n)
         .into_par_iter()
         .map(|idx| {
             let my_start = idx * k;
             let my_neighbors = &full_slice[my_start..my_start + k];
 
             if my_neighbors.is_empty() {
-                return 0.0f32;
+                return 0.0f64;
             }
 
-            let mut local_jaccard_sum = 0.0f32;
+            let mut local_jaccard_sum = 0.0f64;
 
             for &neighbor_idx in my_neighbors {
                 let n_idx = neighbor_idx as usize;
@@ -57,16 +57,17 @@ pub fn compute_snc_score(
                 let union = my_neighbors.len() + neighbor_neighbors.len() - intersection;
 
                 if union > 0 {
-                    local_jaccard_sum += intersection as f32 / union as f32;
+                    local_jaccard_sum += intersection as f64 / union as f64;
                 }
             }
 
-            local_jaccard_sum / my_neighbors.len() as f32
+            local_jaccard_sum / my_neighbors.len() as f64
         })
-        .sum();
+        .collect();
+    let sum_snc: f64 = per_point.iter().sum();
 
     Ok(SncResult {
-        mean_snc_score: sum_snc / n as f32,
+        mean_snc_score: (sum_snc / n as f64) as f32,
     })
 }
 

@@ -19,10 +19,32 @@ pub fn compute_anisotropy_score(
     let n_vectors = evaluator.n_vectors();
     let dim = evaluator.dim;
 
-    let mean_vec = vectors
-        .mean_axis(Axis(0))
-        .ok_or(VecHealthError::EmptyInput)?;
-    let mean_vector_norm = mean_vec.iter().map(|&x| x * x).sum::<f32>().sqrt();
+    let partial_sums: Vec<Vec<f64>> = vectors
+        .axis_chunks_iter(Axis(0), 4096)
+        .into_par_iter()
+        .map(|chunk| {
+            let mut acc = vec![0.0f64; dim];
+            for row in chunk.rows() {
+                for (a, &x) in acc.iter_mut().zip(row.iter()) {
+                    *a += x as f64;
+                }
+            }
+            acc
+        })
+        .collect();
+    if n_vectors == 0 {
+        return Err(VecHealthError::EmptyInput);
+    }
+    let mut mean64 = vec![0.0f64; dim];
+    for part in &partial_sums {
+        for (m, &p) in mean64.iter_mut().zip(part.iter()) {
+            *m += p;
+        }
+    }
+    for m in mean64.iter_mut() {
+        *m /= n_vectors as f64;
+    }
+    let mean_vector_norm = mean64.iter().map(|&m| m * m).sum::<f64>().sqrt() as f32;
 
     if n_vectors < 2 {
         return Ok(AnisotropyResult {
@@ -31,27 +53,33 @@ pub fn compute_anisotropy_score(
             top10_variance_ratio: 0.0,
         });
     }
-    
-    let mut centered = vectors.to_owned();
-    centered
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .for_each(|mut row| {
-            row.zip_mut_with(&mean_vec, |x, &m| *x -= m);
-        });
 
-    let slice = centered
-        .as_slice_memory_order()
-        .ok_or(VecHealthError::EmptyInput)?;
-    
-    let centered_mat = mat::from_row_major_slice(slice, n_vectors, dim);
-    
-    let inv_n_minus_1 = 1.0f32 / (n_vectors as f32 - 1.0);
-    let covariance = Scale(inv_n_minus_1) * (centered_mat.transpose() * centered_mat);
+    let mut covariance = mat::Mat::<f64>::zeros(dim, dim);
+    let block_rows = 4096usize;
+    let mut block = vec![0.0f64; block_rows * dim];
+    for chunk in vectors.axis_chunks_iter(Axis(0), block_rows) {
+        let rows = chunk.nrows();
+        for (r, row) in chunk.rows().into_iter().enumerate() {
+            let dst = &mut block[r * dim..(r + 1) * dim];
+            for ((d, &x), &m) in dst.iter_mut().zip(row.iter()).zip(mean64.iter()) {
+                *d = x as f64 - m;
+            }
+        }
+        let b = mat::from_row_major_slice(&block[..rows * dim], rows, dim);
+        faer::linalg::matmul::matmul(
+            covariance.as_mut(),
+            b.transpose(),
+            b,
+            Some(1.0),
+            1.0,
+            Parallelism::Rayon(0),
+        );
+    }
+    let covariance = Scale(1.0f64 / (n_vectors as f64 - 1.0)) * covariance;
     
     let eigendecomposition = covariance.selfadjoint_eigendecomposition(Side::Lower);
 
-    let mut eigenvalues: Vec<f32> = (0..dim)
+    let mut eigenvalues: Vec<f64> = (0..dim)
         .map(|i| eigendecomposition.s().column_vector().read(i))
         .collect();
 
@@ -61,12 +89,12 @@ pub fn compute_anisotropy_score(
         *v = v.max(0.0);
     }
 
-    let total_variance: f32 = eigenvalues.iter().sum();
+    let total_variance: f64 = eigenvalues.iter().sum();
 
     let (top1_variance_ratio, top10_variance_ratio) = if total_variance > 0.0 {
-        let top1 = eigenvalues[0] / total_variance;
+        let top1 = (eigenvalues[0] / total_variance) as f32;
         let top10_count = dim.min(10);
-        let top10 = eigenvalues[..top10_count].iter().sum::<f32>() / total_variance;
+        let top10 = (eigenvalues[..top10_count].iter().sum::<f64>() / total_variance) as f32;
         (top1, top10)
     } else {
         (0.0, 0.0)
@@ -77,4 +105,29 @@ pub fn compute_anisotropy_score(
         top1_variance_ratio,
         top10_variance_ratio,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    
+    #[test]
+    fn mean_vector_norm_matches_f64_reference() {
+        use rand::{Rng, SeedableRng};
+        let (n, dim) = (20_000usize, 64usize);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let data: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-0.2f32..1.0)).collect();
+        let vectors = ndarray::Array2::from_shape_vec((n, dim), data).unwrap();
+        let mut mean = vec![0.0f64; dim];
+        for row in vectors.rows() {
+            for (m, &x) in mean.iter_mut().zip(row.iter()) {
+                *m += x as f64;
+            }
+        }
+        let reference = mean.iter().map(|m| (m / n as f64).powi(2)).sum::<f64>().sqrt();
+        let evaluator = VecHealthEvaluator::new(vectors).unwrap();
+        let r = compute_anisotropy_score(&evaluator).unwrap();
+        assert!(((r.mean_vector_norm as f64 - reference) / reference).abs() < 1e-6);
+    }
 }

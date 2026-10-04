@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Private planning notes: kept on disk, never published
+rust/TODO*.md
+rust/tesk.txt

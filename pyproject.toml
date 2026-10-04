@@ -1,22 +1,62 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "vechealth"
-version = "0.1.0"
-description = "Observability and diagnostic framework for embedding spaces and vector stores"
+dynamic = ["version"]
+description = "Label-free geometric diagnostics for embedding spaces and vector stores"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
+license = { text = "Apache-2.0" }
 keywords = ["embeddings", "vector-database", "observability", "RAG", "diagnostics", "topological-data-analysis"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Typing :: Typed",
     "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
 ]
+dependencies = ["numpy>=1.23"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["python/vechealth"]
+[project.scripts]
+vechealth = "vechealth.cli:main"
+
+[project.urls]
+Repository = "https://github.com/JakubDras/vechealth"
+Issues = "https://github.com/JakubDras/vechealth/issues"
+Changelog = "https://github.com/JakubDras/vechealth/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# Only needed by VecHealthEvaluator.from_lancedb. The native LanceDB connector
+# is left out of the PyPI wheels (it is by far the heaviest dependency tree),
+# so this connector is a thin wrapper over the official SDK; builds compiled
+# with `--features lancedb` keep the native one. Tested with lancedb 0.38.
+lancedb = ["lancedb>=0.38,<1"]
+# Only needed by VecHealthEvaluator.from_weaviate — Weaviate has no
+# maintained official Rust client, so that connector is a thin wrapper over
+# this SDK instead.
+weaviate = ["weaviate-client>=4,<5"]
+# Only needed by VecHealthEvaluator.from_chroma/from_milvus/from_pinecone —
+# none of these three have a maintained official Rust client either, so
+# they're thin wrappers over each vendor's official SDK, same as Weaviate
+# above.
+chroma = ["chromadb>=1,<2"]
+milvus = ["pymilvus>=2.4,<4"]
+pinecone = ["pinecone>=6,<11"]
+
+[tool.maturin]
+manifest-path = "rust/bindings/Cargo.toml"
+python-source = "rust/bindings/python"
+module-name = "vechealth._core"
+features = ["pyo3/extension-module"]
+# maturin puts the license in wheels, but not in the sdist, unless asked.
+include = [{ path = "LICENSE", format = "sdist" }]

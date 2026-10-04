@@ -1,0 +1,60 @@
+[package]
+name = "vechealth-connectors"
+version = "0.2.0-alpha.1"
+edition = "2021"
+
+[lib]
+name = "vechealth_connectors"
+crate-type = ["rlib"]
+
+# Local file loaders (.npy / .csv / .parquet) are always compiled. Every
+# network connector sits behind its own feature so a build only pays for the
+# dependencies it needs:
+#   qdrant    gRPC client (tonic/rustls)           — on by default
+#   pgvector  Postgres driver                      — on by default
+#   lancedb   LanceDB + DataFusion (≈580 crates)   — OFF by default; it is the
+#             single largest contributor to binary size and build time, and
+#             also pulls in a C toolchain and `protoc` at build time. The
+#             Python package falls back to the official `lancedb` SDK when
+#             this feature is not compiled in (see vechealth/connectors/).
+[features]
+default = ["qdrant", "pgvector"]
+qdrant = ["dep:qdrant-client", "dep:tokio"]
+pgvector = ["dep:postgres", "dep:pgvector"]
+lancedb = ["dep:lancedb", "dep:futures", "dep:tokio"]
+
+[dependencies]
+# Pinned to the last ndarray-npy release built against ndarray 0.15 — 0.9+
+# requires ndarray 0.16/0.17, which conflicts with the ndarray 0.15 that
+# `numpy` 0.21 (PyO3 bindings, see rust/bindings) hard-requires (`>=0.13,<0.16`).
+# Bumping ndarray workspace-wide would mean bumping pyo3/numpy too, which is
+# out of scope here.
+ndarray = "0.15"
+ndarray-npy = "=0.8.1"
+csv = "1.4"
+arrow = { version = "59", default-features = false, features = ["prettyprint"] }
+# "snap": pandas'/pyarrow's `DataFrame.to_parquet()` defaults to Snappy
+# compression with no codec argument, and this project's own benchmark
+# generators (`python/benchmarks/synthetic/*.py`) call it exactly that way —
+# without this feature, `load_parquet` fails on essentially every real-world
+# .parquet file, including our own.
+parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
+
+# --- optional network connectors (see [features]) ---
+qdrant-client = { version = "1.19", optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
+postgres = { version = "0.19", optional = true }
+pgvector = { version = "0.4", features = ["postgres"], optional = true }
+# NOTE: lancedb's internal `lance-index`/`lance-table`/`lance-datafusion`
+# crates compile .proto files at build time via `prost-build`, which needs a
+# `protoc` binary on PATH (or `PROTOC` pointing to one) unless their own
+# "protoc" feature is turned on — and that feature vendors protobuf's C++
+# source and builds it via `cmake`, trading a `protoc` requirement for a
+# `cmake` + C++ toolchain one, which is heavier, not lighter. So: building
+# with the `lancedb` feature needs a system `protoc` (Debian/Ubuntu:
+# `apt-get install protobuf-compiler`).
+lancedb = { version = "=0.37.1", default-features = false, optional = true }
+futures = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

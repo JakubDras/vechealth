@@ -1,5 +1,4 @@
 use crate::knn::{VecHealthError, VecHealthEvaluator};
-use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct DuplicatesResult {
@@ -24,20 +23,17 @@ pub fn compute_ndds_score(
             min_distance_global: 0.0,
         });
     }
-
-    let (ndds_count, sum_distance, min_dist) = closest_distances
-        .into_par_iter()
-        .map(|&dist| {
+    
+    let (ndds_count, sum_distance, min_dist) = closest_distances.iter().fold(
+        (0u32, 0.0f64, f32::MAX),
+        |a, &dist| {
             let is_duplicate = if dist < epsilon { 1u32 } else { 0u32 };
-            (is_duplicate, dist, dist)
-        })
-        .reduce(
-            || (0u32, 0.0f32, f32::MAX),
-            |a, b| (a.0 + b.0, a.1 + b.1, a.2.min(b.2)),
-        );
+            (a.0 + is_duplicate, a.1 + dist as f64, a.2.min(dist))
+        },
+    );
 
     let ndds_fraction = ndds_count as f32 / n as f32;
-    let mean_1nn_distance = sum_distance / n as f32;
+    let mean_1nn_distance = (sum_distance / n as f64) as f32;
     let min_distance_global = if min_dist == f32::MAX { 0.0 } else { min_dist };
 
     Ok(DuplicatesResult {

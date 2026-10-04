@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "connectors",
+    "report",
+    "bindings",
+]
+
+# Release builds are what ships in the wheels, so they are tuned for size
+# first: symbols are stripped and thin LTO + a single codegen unit let the
+# linker drop unused code. Panics keep the default `unwind` strategy on
+# purpose — PyO3 turns a Rust panic into a Python exception, whereas
+# `panic = "abort"` would kill the whole interpreter.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
