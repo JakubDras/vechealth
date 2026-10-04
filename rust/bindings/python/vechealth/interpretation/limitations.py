@@ -71,7 +71,7 @@ SHORT_READING_NOTE = (
     "benchmark they did not predict retrieval quality, and the direction of a change "
     "is not validated as good or bad. Use them to compare a deployment with its own "
     "history, calibrate thresholds to your data, and measure retrieval quality "
-    "yourself. See the README ('What the evidence does not support')."
+    "yourself. See the README ('Good to know')."
 )
 
 

@@ -9,6 +9,7 @@ description = "Label-free geometric diagnostics for embedding spaces and vector 
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
+authors = [{ name = "Jakub Dras" }]
 keywords = ["embeddings", "vector-database", "observability", "RAG", "diagnostics", "topological-data-analysis"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
